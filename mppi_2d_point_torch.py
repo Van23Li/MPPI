@@ -3,6 +3,7 @@ from numpy import matlib as mb
 # import numpy.matlib
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import scipy.io as scio
 import torch
 # clear('all')
 # close_('all','force')
@@ -10,29 +11,24 @@ import torch
 # rng('default')
 class MPPI:
     def __init__(self, ax):
+        device = torch.device('mps')
+        tensor_args = {'device': device, 'dtype': torch.float32}
+        self.tensor_args = tensor_args
+
         self.ax = ax
         ## Constants and Parameters
         self.D = 2
         self.H = 30
         self.SIGMA = np.array([1,0.1])
         self.N_POL = np.size(self.SIGMA)
-        self.MU_ARR = np.zeros((self.D,self.H,self.N_POL))
+        self.MU_ARR = torch.zeros(self.D, self.H, self.N_POL, **tensor_args)
 
         self.N_TRAJ = 50
-        pos_init = np.zeros((self.D,1))
+        pos_init = torch.zeros(self.D,1, **tensor_args)
         self.pos_goal = pos_init + 6
-        gamma_vec = np.append(np.array([0.98 ** i for i in np.linspace(1,self.H - 1,self.H - 1)]), 1.02**self.H)
+        self.gamma_vec = torch.cat((torch.tensor([0.98 ** i for i in np.linspace(1,self.H - 1,self.H - 1)]), torch.tensor([1.02**self.H])),0).to(**self.tensor_args)
 
         self.beta = 0.9
-
-        ## lambdas
-        # get_norm_samples = lambda MU_ARR, SIGMA, N_TRAJ: np.random.multivariate_normal((mb.repmat(MU_ARR,1,N_TRAJ)).reshape([2,30,50]),SIGMA)
-        self.INT_MAT = np.tril(np.ones((self.H,self.H)))
-        # get_rollout = lambda pos_init, u_sampl, dT: pos_init + pagetranspose(pagemtimes(dT * INT_MAT,pagetranspose(u_sampl)))
-        self.calc_reaching_cost = lambda rollout, goal: np.array([np.linalg.norm((rollout[:,:,i] - goal),ord=2,axis=0) for i in range(50)])
-        # self.obs_dist = lambda rollout, obs_pos, obs_r: np.transpose(np.squeeze(vecnorm(rollout - obs_pos,2,1))) - obs_r
-        self.w_fun = lambda cost: np.exp(- 1 / self.beta * np.sum(gamma_vec * cost, 1))
-        #mu_upd_fun = @(mu, w, u) (1-mu_alpha)*mu +
 
         ## plot preparation
         # plt.ion()
@@ -73,11 +69,16 @@ class MPPI:
             best_cost_iter = 10000000000.0
             for j in range(self.N_POL):
                 u = self.get_norm_samples(self.MU_ARR[:,:,j],self.SIGMA[j],self.N_TRAJ)
-                u[:,:,-1] = u[:,:,-1] * 0
+                # data = scio.loadmat('./u.mat')
+                # u_temp = np.array(data['u'])
+                # u = torch.tensor(u_temp).transpose(0,2).transpose(1,2)
+                # u = u.type(torch.float32)
+                u[-1,:,:] = u[-1,:,:] * 0
+
 
                 #inject slowdown (for acceleration control)
                 ss = 5
-                u[:, 0:ss, -1] = u[:, 0:ss, -1] - self.cur_vel / dT / ss
+                u[-1, :, 0:ss] = u[-1, :, 0:ss] - self.cur_vel / dT / ss
 
                 v_rollout = self.get_rollout(self.cur_vel,u,dT)
                 rollout = self.get_rollout(self.cur_pos,v_rollout,dT)
@@ -88,44 +89,46 @@ class MPPI:
         #d1(d1<0) = 500;
                 cost = cost_p + cost_v
                 w = self.w_fun(cost)
-                w = w / sum(w)
-                best_cost = np.max(w)
-                best_idx = np.argmax(w)
-                w_tens = np.expand_dims(mb.repmat(np.expand_dims(w,1), 1, self.H ).transpose(1, 0), 0)
-                self.MU_ARR[:,:,j] = (1 - mu_alpha) * self.MU_ARR[:,:,j] + mu_alpha * np.sum(np.multiply(w_tens,u), 2)
+                w = w / torch.sum(w)
+                best_cost = torch.max(w)
+                best_idx = torch.argmax(w)
+                self.MU_ARR[:, :, j] = (1 - mu_alpha) * self.MU_ARR[:, :, j] + mu_alpha * torch.sum(torch.mul(w.unsqueeze(1).unsqueeze(2),u), 0)
+
                 for i_traj in range(self.N_TRAJ):
                     self.h_tmp = self.r_h_arr[j][i_traj]
-                    self.h_tmp.set_data(rollout[0,:,i_traj], rollout[1,:,i_traj])
+                    self.h_tmp.set_data(rollout[i_traj,0,:], rollout[i_traj,1,:])
                 if best_cost < best_cost_iter:
-                    cur_pos_temp = rollout[:,0,best_idx]
-                    self.cur_pos = np.expand_dims(cur_pos_temp, axis=1)
-                    cur_vel_temp = v_rollout[:,0,best_idx]
-                    self.cur_vel = np.expand_dims(cur_vel_temp, axis=1)
+                    cur_pos_temp = rollout[best_idx,:,0]
+                    self.cur_pos = cur_pos_temp.unsqueeze(1)
+                    cur_vel_temp = v_rollout[best_idx,:,0]
+                    self.cur_vel = cur_vel_temp.unsqueeze(1)
                     self.cur_pos_h.set_data(self.cur_pos[0], self.cur_pos[1])
                     best_cost_iter = best_cost
-                    self.best_traj_h.set_data(rollout[0,:,best_idx], rollout[1,:,best_idx])
+                    self.best_traj_h.set_data(rollout[best_idx, 0,:], rollout[best_idx, 1,:])
             return self.h_tmp, self.cur_pos_h, self.best_traj_h
 
     def get_norm_samples(self, MU_ARR, SIGMA, N_TRAJ):
-        m = MU_ARR.shape[0]
-        n = MU_ARR.shape[1]
-        result = np.zeros([m, n, N_TRAJ])
-        for i in range(m):
-            for j in range(n):
-                for k in range(N_TRAJ):
-                    # result[i, j, k] = np.random.normal((mb.repmat(MU_ARR, 1, N_TRAJ).reshape([self.D, self.H, self.N_TRAJ]))[i, j, k],
-                    #                                    SIGMA)
-                    result[i, j, k] = np.random.normal(MU_ARR[i, j],SIGMA)
-                    # n = torch.distributions.Normal(torch.tensor(MU_ARR), torch.tensor(SIGMA))
+        result_temp = torch.distributions.Normal(MU_ARR.repeat(self.N_TRAJ,1,1), SIGMA)
+        result = result_temp.sample()
         return result
 
     def get_rollout(self, pos_init, u_sampl, dT):
-        # u_sampl_T = np.array([(u_sampl[:,:,i]).T for i in range(50)]).reshape(30,2,50)
-        u_sampl_T = np.array([(u_sampl[:, :, i]).T for i in range(50)]).transpose(1, 2, 0)
-        u_sampl_time = np.array([np.dot(dT * self.INT_MAT, u_sampl_T[:, :, i]) for i in range(50)]).transpose(1, 2, 0)
-        pos_delta = np.array([(u_sampl_time[:, :, i]).T for i in range(50)]).transpose(1, 2, 0)
-        result = np.array([pos_init + pos_delta[:, :, i] for i in range(50)]).transpose(1, 2, 0)
+        self.INT_MAT = torch.tril(torch.ones(self.H, self.H))
+        # self.INT_MAT = torch.tril(torch.ones(self.H, self.H)).unsqueeze(0)
+        u_sampl_T = u_sampl.transpose(2,1)
+        u_sampl_time = torch.matmul(dT * self.INT_MAT, u_sampl_T)
+        pos_delta = u_sampl_time.transpose(2, 1)
+        result = pos_init + pos_delta
         return result
+
+    def calc_reaching_cost(self, rollout, goal):
+        result = torch.linalg.norm(rollout - goal, dim = 1)
+        return result
+
+    def w_fun(self, cost):
+        result = torch.exp(- 1 / self.beta * torch.sum(self.gamma_vec * cost, 1))
+        return result
+
 
 
 # Creating the Animation object
